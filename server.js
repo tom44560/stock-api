@@ -11,7 +11,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// 取得某月的日K資料
 async function fetchMonthData(symbol, year, month) {
   const ym = `${year}${String(month).padStart(2,"0")}01`;
   const url = `https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=${ym}&stockNo=${symbol}`;
@@ -24,13 +23,23 @@ async function fetchMonthData(symbol, year, month) {
   }));
 }
 
-// 判斷某日期是否為週五（民國日期格式 "115/05/02"）
 function isFriday(rocDate) {
   const parts = rocDate.split("/");
   const y = parseInt(parts[0]) + 1911;
   const m = parseInt(parts[1]) - 1;
   const d = parseInt(parts[2]);
   return new Date(y, m, d).getDay() === 5;
+}
+
+async function getRecentRows(symbol, minCount) {
+  const now = new Date();
+  let rows = [];
+  for (let i = 0; i < 3 && rows.length < minCount; i++) {
+    let d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const r = await fetchMonthData(symbol, d.getFullYear(), d.getMonth() + 1);
+    rows = [...r, ...rows];
+  }
+  return rows;
 }
 
 app.get("/stock", async (req, res) => {
@@ -45,29 +54,57 @@ app.get("/stock", async (req, res) => {
   }
 });
 
-app.get("/fridays", async (req, res) => {
+app.get("/quote", async (req, res) => {
   try {
     const { symbol } = req.query;
-    const now = new Date();
-    let year = now.getFullYear();
-    let month = now.getMonth() + 1;
+    const rows = await getRecentRows(symbol, 20);
+    if (!rows.length) return res.status(404).json({ error: "查無資料" });
 
-    let rows = await fetchMonthData(symbol, year, month);
+    const closes = rows.map(r => r.close);
+    const latest = rows[rows.length - 1];
 
-    // 如果本月資料不足，補抓上個月
-    if (rows.length < 10) {
-      const prevMonth = month === 1 ? 12 : month - 1;
-      const prevYear = month === 1 ? year - 1 : year;
-      const prevRows = await fetchMonthData(symbol, prevYear, prevMonth);
-      rows = [...prevRows, ...rows];
-    }
+    const ma = (n) => {
+      const slice = closes.slice(-n);
+      if (slice.length < n) return null;
+      return Math.round(slice.reduce((a,b)=>a+b,0) / n * 100) / 100;
+    };
 
-    // 篩出所有週五
     const fridays = rows.filter(r => isFriday(r.date));
-
     const thisWeekFriday = fridays[fridays.length - 1] || null;
     const lastWeekFriday = fridays[fridays.length - 2] || null;
 
+    const titleRes = await fetch(
+      `https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo=${symbol}`,
+      { headers: { "User-Agent": "Mozilla/5.0" } }
+    );
+    const titleData = await titleRes.json();
+    const title = titleData.title || "";
+    const titleParts = title.split(" ").map(s=>s.trim()).filter(Boolean);
+    const nameIdx = titleParts.findIndex(p=>p===symbol);
+    const name = nameIdx>=0&&titleParts[nameIdx+1] ? titleParts[nameIdx+1] : symbol;
+
+    res.json({
+      symbol, name,
+      close: latest.close,
+      date: latest.date,
+      ma5: ma(5),
+      ma10: ma(10),
+      ma20: ma(20),
+      thisWeekFriday,
+      lastWeekFriday,
+    });
+  } catch (e) {
+    res.status(500).json({ error: "查詢失敗: " + e.message });
+  }
+});
+
+app.get("/fridays", async (req, res) => {
+  try {
+    const { symbol } = req.query;
+    const rows = await getRecentRows(symbol, 10);
+    const fridays = rows.filter(r => isFriday(r.date));
+    const thisWeekFriday = fridays[fridays.length - 1] || null;
+    const lastWeekFriday = fridays[fridays.length - 2] || null;
     res.json({ thisWeekFriday, lastWeekFriday, allFridays: fridays });
   } catch (e) {
     res.status(500).json({ error: "查詢失敗" });
